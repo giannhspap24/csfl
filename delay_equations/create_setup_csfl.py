@@ -136,11 +136,6 @@ def compute_overhead():
     comm_per_round_accsfl=((av*B + 2 * cm) * N ) / 1000 #convert MB to GB
     comm_per_round_csfl=(((ah*B*2 + 2*wm) * (lamda*N)) + (av*B *N) + (2*av*am) ) / 1000 #convert MB to GB
 
-    # Convert GB to TB
-    #comm_csfl /= 1000
-    #comm_sfl /= 1000
-    #comm_accsfl /= 1000 
-
     return comm_per_round_sfl
 
 if __name__ == "__main__":
