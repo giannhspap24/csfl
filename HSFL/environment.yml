@@ -1,0 +1,23 @@
+name: fl_env_gpu
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1    # change to 11.8 if your system requires 11.8
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - pillow
+  - tqdm
+  - openpyxl
+  - pip
+  - pip:
+      - notebook
+
