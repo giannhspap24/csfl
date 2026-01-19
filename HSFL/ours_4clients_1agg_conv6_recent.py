@@ -47,16 +47,18 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     print(torch.cuda.get_device_name(0))    
 # Hyperparameters
-num_users = 30
-global_epochs = 2
+num_users = 16
+global_epochs = 120
 frac = 1        # Participation of clients
 lr = 0.0001
 batch_size = 32
-fedavg_freq=1
+fedavg_freq=3
+model="VGG-11"
+dataset="CIFAR10"
 #Program identifier
-cut_layer = "conv6"
-collaborative_layer = "conv3"  # Starting conv layer for selective averagingmodel="VGG-11" 
-program = "vgg11_CIFAR10_conv6_4clients_1agg_iid_test_checkpoint"
+cut_layer = "conv8"
+collaborative_layer = "conv1"  # Starting conv layer for selective averagingmodel="VGG-11" 
+program = f"{model.lower().replace('-', '')}_{dataset}_{cut_layer}_{collaborative_layer}_{num_users}clients_{fedavg_freq}freq_2agg_iid_test_checkpoint"
 print(f"---------{program}----------")
 start = time.time()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -78,11 +80,12 @@ test_transforms = transforms.Compose([
 dataset_train = datasets.CIFAR10(root='./data', train=True, transform=train_transforms, download=True)
 dataset_test = datasets.CIFAR10(root='./data', train=False, transform=test_transforms, download=True)
 
-train_iterator = DataLoader(dataset_train, shuffle=True, batch_size=batch_size)
-test_iterator = DataLoader(dataset_test, batch_size=batch_size)
+train_iterator = DataLoader(dataset_train, shuffle=True, batch_size=32)
+test_iterator = DataLoader(dataset_test, batch_size=32)
 
 print(f'Number of training examples: {len(dataset_train)}')
 print(f'Number of testing examples: {len(dataset_test)}')
+
 # Print in color for test/train logs
 def prRed(skk): print("\033[91m {}\033[00m" .format(skk)) 
 def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
@@ -120,23 +123,6 @@ def SelectiveFedAvg(w_locals, selected_layers):
             pass
 
     return w_glob
-    
-def load_client_model(idx, base_model):
-    model = copy.deepcopy(base_model)
-    path = client_ckpt_path(idx)
-
-    if os.path.exists(path):
-        model.load_state_dict(torch.load(path, map_location="cpu"))
-        print(f"Loaded client {idx} model from disk")
-
-    return model
-    
-def save_and_unload_client(model, idx):
-    torch.save(model.state_dict(), client_ckpt_path(idx))
-    #print(f"2. GPU memory before deleting model: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
-    del model
-    torch.cuda.empty_cache()
-    #print(f"2. GPU memory after deleting model and emptying cache: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
 
 #Compute the outputdimensions for the client-side and the server-side models
 def compute_output_dim(module, input_size):
@@ -149,7 +135,39 @@ def compute_output_dim(module, input_size):
         output_size = compute_window_output(input_size=input_size, kernel_size=module.kernel_size, padding=module.padding, stride=module.stride)
     else:
         return input_size
-    return output_size
+    return output_size  
+  
+def load_client_model(idx, base_model, optimizer=None):
+    model = copy.deepcopy(base_model)
+    path = client_ckpt_path(idx)
+
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location="cpu")
+        model.load_state_dict(ckpt["model"])
+        print(f"Loaded client {idx} model")
+
+        if optimizer is not None and "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print(f"Loaded client {idx} optimizer")
+
+    return model
+
+
+    return model
+    
+def save_and_unload_client(model, optimizer, idx):
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        client_ckpt_path(idx),
+    )
+    del model
+    del optimizer
+    torch.cuda.empty_cache()
+
+    #print(f"2. GPU memory after deleting model and emptying cache: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
 
 # Dynamically splits the AlexNet model into client-side and server-side models
 def split_model_at_layer(cut_layer, input_size, input_channels, num_classes):
@@ -310,6 +328,7 @@ w_locals_server = []
 idx_collect = []
 l_epoch_check = False
 fed_check = False
+
 # Initialization of net_model_server and net_server (server-side model)
 net_model_server = [None for i in range(num_users)]  # placeholders, load from disk when needed
 net_server = None  # will be loaded per client
@@ -365,9 +384,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
         count1 = 0
 
         prRed(f'Client{idx} Train => Local Epoch: {l_epoch_count} \tAcc: {acc_avg_train:.3f} \tLoss: {loss_avg_train:.4f}')
-        
-        # copy the last trained model in the batch       
-        w_server = net_server.state_dict()      
+
         
         # If one local epoch is completed, after this a new client will come
         if l_epoch_count == l_epoch-1:
@@ -409,6 +426,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
             
             # server-side global model update and distribute that model to all clients ------------------------------
             net_glob_server.load_state_dict(w_glob_server)    
+            
             # Save global to all server checkpoints
             for i in range(num_users):
                 torch.save(w_glob_server, server_ckpt_path(i))
@@ -424,8 +442,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
             
             acc_train_collect_user = []
             loss_train_collect_user = []            
-    # send gradients to the client               
-    #return dfx_client
+
 # Server-side functions associated with Testing
 def evaluate_server(fx_client, y, idx, len_batch, ell):
     global net_model_server, criterion, batch_acc_test, batch_loss_test, check_fed, net_server, net_glob_server 
@@ -501,8 +518,6 @@ def evaluate_server(fx_client, y, idx, len_batch, ell):
                 print(' Train: Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}'.format(ell, acc_avg_all_user_train, loss_avg_all_user_train))
                 print(' Test: Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}'.format(ell, acc_avg_all_user, loss_avg_all_user))
                 print("==========================================================")
-            
-         
     return 
 #==============================================================================================================
 #                                       Clients-side Program
@@ -529,6 +544,17 @@ class Client(object):
         self.fc_local.train()
         optimizer_client = torch.optim.Adam(net.parameters(), lr=self.lr)
         optimizer_fc_local = torch.optim.Adam(self.fc_local.parameters(), lr=self.lr)
+
+         # 2️⃣ LOAD model + optimizer state IF checkpoint exists
+        path = client_ckpt_path(self.idx)
+        if os.path.exists(path):
+            ckpt = torch.load(path, map_location="cpu")
+            net.load_state_dict(ckpt["model"])
+            optimizer_client.load_state_dict(ckpt["optimizer"])
+            print(f"Client {self.idx}: optimizer restored")
+            
+            print(f"Client {self.idx} Adam state size:",
+            len(optimizer_client.state_dict()["state"]))
         
         for iter in range(self.local_ep):
             len_batch = len(self.ldr_train)
@@ -561,10 +587,15 @@ class Client(object):
 
                 del images, labels
                 torch.cuda.empty_cache()
-            
-            #prRed('Client{} Train => Epoch: {}'.format(self.idx, ell))
-           
-        return net.state_dict() 
+
+        # 4️⃣ SAVE model + optimizer
+        torch.save({
+            "model": net.state_dict(),
+            "optimizer": optimizer_client.state_dict()
+        }, client_ckpt_path(self.idx))
+
+        #return net.state_dict() 
+        return net.state_dict(), optimizer_client
 
     def evaluate(self, net, ell):
         net.eval()
@@ -576,8 +607,7 @@ class Client(object):
                 images, labels = images.to(self.device), labels.to(self.device)
                 # Forward pass
                 features = net(images)
-                #outputs = self.fc_local(features)
-                # Send activations to the server for server-side evaluation
+
                 evaluate_server(features, labels, self.idx, len_batch, ell)
 
 def dataset_iid(dataset, num_users):
@@ -587,6 +617,7 @@ def dataset_iid(dataset, num_users):
         dict_users[i] = set(np.random.choice(all_idxs, num_items, replace = False))
         all_idxs = list(set(all_idxs) - dict_users[i])
     return dict_users    
+
 #----------------------------------------------------------------
 def dataset_non_iid(dataset, num_users, num_shards=5000, num_samples_per_shard=12):
     """
@@ -641,36 +672,15 @@ net_glob_client.train()
 w_glob_client = net_glob_client.state_dict()
 
 # Grouping clients into two groups
-group1 = range(0,19)
-group2 = range(20,29)
+group1 = range(0,7)
+group2 = range(8,15)
+
+#group1 = range(0,3)
+#group2 = []
 
 # Initialize separate global models for each group
 w_glob_client1 = copy.deepcopy(w_glob_client)
 w_glob_client2 = copy.deepcopy(w_glob_client)
-
-# Federation takes place after certain local epochs in train() client-side
-# this epoch is global epoch, also known as rounds
-
-# CONV 8 AGGR LAYERS
-#selected_layers = ["0.weight", "0.bias", "3.weight", "3.bias","6.weight", "6.bias", "8.weight", "8.bias", "11.weight", "11.bias", "13.weight", "13.bias", "16.weight", "16.bias", "18.weight", "18.bias"]
-
-# CONV 7 AGGR LAYERS
-# selected_layers = ["0.weight", "0.bias", "3.weight", "3.bias","6.weight", "6.bias", "8.weight", "8.bias", "11.weight", "11.bias", "13.weight", "13.bias", "16.weight", "16.bias"]
-
-# CONV 6 AGGR LAYERS
-#selected_layers = ["6.weight", "6.bias", "8.weight", "8.bias", "11.weight", "11.bias", "13.weight", "13.bias"]
-
-# CONV 5 AGGR LAYERS
-#selected_layers = ["0.weight", "0.bias", "3.weight", "3.bias","6.weight", "6.bias", "8.weight", "8.bias", "11.weight", "11.bias"]
-
-# CONV 4 AGGR LAYERS
-#selected_layers = ["0.weight", "0.bias", "3.weight", "3.bias","6.weight", "6.bias","8.weight", "8.bias"]
-
-# CONV 3 AGGR LAYERS
-# selected_layers = ["0.weight", "0.bias", "3.weight", "3.bias","6.weight", "6.bias"]
-
-# CONV 2 AGGR LAYERS
-#selected_layers = ["0.weight", "0.bias", "3.weight", "3.bias"]
 
 def get_selected_layers(collaborative_layer, cut_layer):
     """
@@ -714,9 +724,11 @@ for iter in range(global_epochs):
         net_client = net_client.to(device)
         #print(f"1. GPU memory after moving net_client to GPU: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
         local = Client(net_glob_client, idx, lr, device, dataset_train = dataset_train, dataset_test = dataset_test, idxs = dict_users[idx], idxs_test = dict_users_test[idx],     fc_dim=client_output_shape[1]*client_output_shape[2]*client_output_shape[3])        
-        w_client = local.train(net_client)
-        net_client.to('cpu')
-        save_and_unload_client(net_client, idx)
+        w_client, opt_client = local.train(net_client)
+        net_client.to("cpu")
+        save_and_unload_client(net_client, opt_client, idx)
+
+        
         
         # Add the local model weights to the appropriate group
         if idx in group1:
@@ -745,48 +757,44 @@ for iter in range(global_epochs):
    
     # Selective federated averaging for group 1 (incremental to save memory)
     if w_locals_client1:
-        w_glob_client1 = copy.deepcopy(w_locals_client1[0])
-        for client_w in w_locals_client1[1:]:
-            for k in w_glob_client1.keys():
-                if k in selected_layers:
-                    w_glob_client1[k] += client_w[k]
-                # Non-selected layers keep from first client
+        w_glob_client1 = copy.deepcopy(net_glob_client.state_dict())  # Start from current global model, non-selected layers remain unchanged
+        selected_sum1 = {k: torch.zeros_like(v) for k, v in w_glob_client1.items() if k in selected_layers}
+        for client_w in w_locals_client1:
+            for k in selected_layers:
+                selected_sum1[k] += client_w[k]
         # Divide selected layers by number of clients
         num_clients1 = len(w_locals_client1)
         for k in selected_layers:
-            if k in w_glob_client1:
-                w_glob_client1[k] = torch.div(w_glob_client1[k], num_clients1)
+            w_glob_client1[k] = torch.div(selected_sum1[k], num_clients1)
 
     # Selective federated averaging for group 2 (incremental to save memory)
     if w_locals_client2:
-        w_glob_client2 = copy.deepcopy(w_locals_client2[0])
-        for client_w in w_locals_client2[1:]:
-            for k in w_glob_client2.keys():
-                if k in selected_layers:
-                    w_glob_client2[k] += client_w[k]
-                # Non-selected layers keep from first client
+        w_glob_client2 = copy.deepcopy(net_glob_client.state_dict())  # Start from current global model, non-selected layers remain unchanged
+        selected_sum2 = {k: torch.zeros_like(v) for k, v in w_glob_client2.items() if k in selected_layers}
+        for client_w in w_locals_client2:
+            for k in selected_layers:
+                selected_sum2[k] += client_w[k]
         # Divide selected layers by number of clients
         num_clients2 = len(w_locals_client2)
         for k in selected_layers:
-            if k in w_glob_client2:
-                w_glob_client2[k] = torch.div(w_glob_client2[k], num_clients2)
+            w_glob_client2[k] = torch.div(selected_sum2[k], num_clients2)
     
     # Clear the lists to free memory
-    del w_locals_client1
-    del w_locals_client2
+    #del w_locals_client1
+    #del w_locals_client2
     # Fed  Server: Federation process at Client-Side-----------
     if (iter + 1) % fedavg_freq == 0: #update and the aggregators' models and the whole models
         print("Federated Averaging")
+        num_groups=2
         # Combine group aggregations to update global model
         if w_glob_client1 is not None and w_glob_client2 is not None:
             w_glob_combined = copy.deepcopy(w_glob_client1)
             for k in w_glob_combined.keys():
                 w_glob_combined[k] += w_glob_client2[k]
-                w_glob_combined[k] = torch.div(w_glob_combined[k], 2)  # Average of 2 groups
+                w_glob_combined[k] = torch.div(w_glob_combined[k], num_groups)  # Average of 2 groups
 
         if 'w_glob_combined' in locals():
             net_glob_client.load_state_dict(w_glob_combined)
-    
     else: #update only the aggregators' models!
         # Assign global weights back to clients
         for idx in idxs_users:
